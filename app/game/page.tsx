@@ -22,6 +22,7 @@ const SPORTS = [
 ];
 
 type GamePhase = "menu" | "lobby" | "waiting" | "playing" | "results";
+type SocketStatus = "connecting" | "connected" | "disconnected";
 
 interface Question {
     question: string;
@@ -40,12 +41,42 @@ interface GameState {
     winner?: string;
 }
 
+interface CreateRoomResponse {
+    code?: string | number;
+    roomCode?: string | number;
+}
+
 const getErrorMessage = (error: unknown, fallback: string) => {
     if (axios.isAxiosError<{ message?: string }>(error)) {
         return error.response?.data?.message || fallback;
     }
 
     return fallback;
+};
+
+const normalizeRoomCode = (code: string | number) =>
+    String(code).trim().toUpperCase();
+
+const getStoredUserId = () => {
+    const storedUserId = localStorage.getItem("userId");
+
+    if (
+        storedUserId &&
+        storedUserId !== "undefined" &&
+        storedUserId !== "null"
+    ) {
+        return storedUserId;
+    }
+
+    const userEmail = localStorage.getItem("userEmail");
+
+    if (userEmail) {
+        return userEmail;
+    }
+
+    const anonymousUserId = crypto.randomUUID();
+    localStorage.setItem("userId", anonymousUserId);
+    return anonymousUserId;
 };
 
 const hashString = (value: string) => {
@@ -74,6 +105,7 @@ const getShuffledAnswers = (question: Question) =>
 export default function GamePage() {
     const router = useRouter();
     const socketRef = useRef<Socket | null>(null);
+    const startTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const [gamePhase, setGamePhase] = useState<GamePhase>("menu");
     const [selectedSport, setSelectedSport] = useState("");
     const [roomCode, setRoomCode] = useState("");
@@ -82,6 +114,9 @@ export default function GamePage() {
     const [selectedAnswer, setSelectedAnswer] = useState<string | null>(null);
     const [isAnswered, setIsAnswered] = useState(false);
     const [loading, setLoading] = useState(false);
+    const [startingGame, setStartingGame] = useState(false);
+    const [socketStatus, setSocketStatus] =
+        useState<SocketStatus>("connecting");
     const [error, setError] = useState("");
 
     useEffect(() => {
@@ -92,24 +127,51 @@ export default function GamePage() {
             return;
         }
 
-        const socket = io(BACKEND_URL);
+        const socket = io(BACKEND_URL, {
+            transports: ["websocket", "polling"],
+            auth: { token },
+        });
         socketRef.current = socket;
+
+        socket.on("connect", () => {
+            setSocketStatus("connected");
+            setError("");
+        });
+
+        socket.on("disconnect", () => {
+            setSocketStatus("disconnected");
+        });
+
+        socket.on("connect_error", (err) => {
+            setSocketStatus("disconnected");
+            setError(`Socket connection failed: ${err.message}`);
+        });
 
         socket.on("room_ready", () => {
             setGamePhase("waiting");
+            setError("");
         });
 
         socket.on("game_started", (data: GameState) => {
+            if (startTimeoutRef.current) {
+                clearTimeout(startTimeoutRef.current);
+                startTimeoutRef.current = null;
+            }
+
+            setStartingGame(false);
             setGameState(data);
             setGamePhase("playing");
             setSelectedAnswer(null);
             setIsAnswered(false);
+            setError("");
         });
 
         socket.on("next_question", (data: GameState) => {
+            setStartingGame(false);
             setGameState(data);
             setSelectedAnswer(null);
             setIsAnswered(false);
+            setError("");
         });
 
         socket.on(
@@ -139,11 +201,34 @@ export default function GamePage() {
             setGamePhase("results");
         });
 
-        socket.on("error", (data: { message: string }) => {
-            setError(data.message);
+        socket.on("error", (data: { message?: string } | string) => {
+            setStartingGame(false);
+            setError(
+                typeof data === "string"
+                    ? data
+                    : data.message || "Socket error",
+            );
+        });
+
+        socket.on("game_error", (data: { message?: string } | string) => {
+            setStartingGame(false);
+            setError(
+                typeof data === "string" ? data : data.message || "Game error",
+            );
+        });
+
+        socket.on("room_error", (data: { message?: string } | string) => {
+            setError(
+                typeof data === "string" ? data : data.message || "Room error",
+            );
         });
 
         return () => {
+            if (startTimeoutRef.current) {
+                clearTimeout(startTimeoutRef.current);
+                startTimeoutRef.current = null;
+            }
+
             socket.removeAllListeners();
             socket.disconnect();
             socketRef.current = null;
@@ -161,24 +246,34 @@ export default function GamePage() {
 
         try {
             const token = localStorage.getItem("token");
-            const response = await axios.get<{ code?: string }>(
+            const response = await axios.get<CreateRoomResponse>(
                 `${BACKEND_URL}/create`,
                 {
                     headers: { Authorization: `Bearer ${token}` },
                 },
             );
 
-            if (!response.data.code) {
+            const createdCode = response.data.code ?? response.data.roomCode;
+
+            if (!createdCode) {
                 setError("Failed to create room");
                 return;
             }
 
-            const userId = localStorage.getItem("userId") || "user1";
-            socketRef.current?.emit("join_room", {
-                code: response.data.code,
+            if (!socketRef.current?.connected) {
+                setError(
+                    "Socket is still connecting. Please try again in a moment.",
+                );
+                return;
+            }
+
+            const normalizedCode = normalizeRoomCode(createdCode);
+            const userId = getStoredUserId();
+            socketRef.current.emit("join_room", {
+                code: normalizedCode,
                 userId,
             });
-            setRoomCode(response.data.code);
+            setRoomCode(normalizedCode);
             setGamePhase("waiting");
         } catch (err: unknown) {
             setError(getErrorMessage(err, "Failed to create room"));
@@ -194,29 +289,68 @@ export default function GamePage() {
         }
 
         setError("");
-        const normalizedCode = joinCode.trim().toUpperCase();
-        const userId = localStorage.getItem("userId") || "user2";
-        socketRef.current?.emit("join_room", { code: normalizedCode, userId });
+
+        if (!socketRef.current?.connected) {
+            setError(
+                "Socket is still connecting. Please try again in a moment.",
+            );
+            return;
+        }
+
+        const normalizedCode = normalizeRoomCode(joinCode);
+        const userId = getStoredUserId();
+        socketRef.current.emit("join_room", { code: normalizedCode, userId });
         setRoomCode(normalizedCode);
         setGamePhase("waiting");
     };
 
     const startGame = () => {
-        if (socketRef.current && roomCode) {
-            socketRef.current.emit("game_start", {
-                code: roomCode,
-                sport: selectedSport,
-            });
+        if (!roomCode || !selectedSport) {
+            setError(
+                "Missing room code or sport. Please create the room again.",
+            );
+            return;
         }
+
+        if (!socketRef.current?.connected) {
+            setError("Socket is disconnected. Refresh and try again.");
+            return;
+        }
+
+        setError("");
+        setStartingGame(true);
+
+        const payload = {
+            code: normalizeRoomCode(roomCode),
+            sport: selectedSport,
+            userId: getStoredUserId(),
+        };
+
+        socketRef.current.emit("game_start", payload);
+
+        if (startTimeoutRef.current) {
+            clearTimeout(startTimeoutRef.current);
+        }
+
+        startTimeoutRef.current = setTimeout(() => {
+            setStartingGame(false);
+            setError(
+                "Start request was sent, but the backend did not send a game_started event. Check the backend socket event name and room-code handling.",
+            );
+        }, 10000);
     };
 
     const submitAnswer = () => {
-        if (socketRef.current && roomCode && selectedAnswer && !isAnswered) {
-            const userId = localStorage.getItem("userId") || "user1";
+        if (
+            socketRef.current?.connected &&
+            roomCode &&
+            selectedAnswer &&
+            !isAnswered
+        ) {
             socketRef.current.emit("submit_answer", {
-                code: roomCode,
+                code: normalizeRoomCode(roomCode),
                 answer: selectedAnswer,
-                userId,
+                userId: getStoredUserId(),
             });
             setIsAnswered(true);
         }
@@ -339,12 +473,18 @@ export default function GamePage() {
                                 <div className="mt-6 grid gap-3">
                                     <button
                                         onClick={handleCreateRoom}
-                                        disabled={!selectedSport || loading}
+                                        disabled={
+                                            !selectedSport ||
+                                            loading ||
+                                            socketStatus !== "connected"
+                                        }
                                         className="h-13 rounded-full bg-slate-950 px-6 text-base font-black text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
                                     >
                                         {loading
                                             ? "Creating room..."
-                                            : "Create room"}
+                                            : socketStatus !== "connected"
+                                              ? "Connecting..."
+                                              : "Create room"}
                                     </button>
                                     <button
                                         onClick={() => {
@@ -402,10 +542,15 @@ export default function GamePage() {
                                 <div className="mt-7 grid gap-3 sm:grid-cols-2">
                                     <button
                                         onClick={handleJoinRoom}
-                                        disabled={!joinCode}
+                                        disabled={
+                                            !joinCode ||
+                                            socketStatus !== "connected"
+                                        }
                                         className="h-13 rounded-full bg-slate-950 px-6 text-base font-black text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50"
                                     >
-                                        Join room
+                                        {socketStatus !== "connected"
+                                            ? "Connecting..."
+                                            : "Join room"}
                                     </button>
                                     <button
                                         onClick={() => setGamePhase("menu")}
@@ -457,12 +602,30 @@ export default function GamePage() {
                                     ))}
                                 </div>
 
+                                {error && (
+                                    <div className="mx-auto mt-6 max-w-xl rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-semibold text-red-700">
+                                        {error}
+                                    </div>
+                                )}
+
+                                <p className="mt-5 text-sm font-semibold text-slate-500">
+                                    Socket: {socketStatus}
+                                </p>
+
                                 {selectedSport && roomCode && (
                                     <button
                                         onClick={startGame}
-                                        className="mt-8 h-13 w-full rounded-full bg-slate-950 px-6 text-base font-black text-white transition hover:bg-slate-800 sm:w-auto sm:min-w-56"
+                                        disabled={
+                                            startingGame ||
+                                            socketStatus !== "connected"
+                                        }
+                                        className="mt-8 h-13 w-full rounded-full bg-slate-950 px-6 text-base font-black text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-50 sm:w-auto sm:min-w-56"
                                     >
-                                        Start game
+                                        {startingGame
+                                            ? "Starting..."
+                                            : socketStatus !== "connected"
+                                              ? "Reconnecting..."
+                                              : "Start game"}
                                     </button>
                                 )}
                             </div>

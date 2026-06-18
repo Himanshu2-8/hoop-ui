@@ -9,6 +9,12 @@ import axios from "axios";
 const BACKEND_URL =
     process.env.NEXT_PUBLIC_BACKEND_URL || "http://localhost:8001";
 
+interface JwtPayload {
+    id?: string;
+    userId?: string;
+    sub?: string;
+}
+
 const getErrorMessage = (error: unknown, fallback: string) => {
     if (axios.isAxiosError<{ message?: string }>(error)) {
         return error.response?.data?.message || fallback;
@@ -60,10 +66,15 @@ export default function SignIn() {
                         )
                         .join(""),
                 );
-                const { id } = JSON.parse(jsonPayload);
+                const payload = JSON.parse(jsonPayload) as JwtPayload;
+                const userId =
+                    payload.id ||
+                    payload.userId ||
+                    payload.sub ||
+                    formData.email;
 
                 localStorage.setItem("token", response.data.token);
-                localStorage.setItem("userId", id);
+                localStorage.setItem("userId", userId);
                 localStorage.setItem("userEmail", formData.email);
                 router.push("/game");
             }
