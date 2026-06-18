@@ -119,6 +119,13 @@ export default function GamePage() {
         useState<SocketStatus>("connecting");
     const [error, setError] = useState("");
 
+    const clearStartTimeout = () => {
+        if (startTimeoutRef.current) {
+            clearTimeout(startTimeoutRef.current);
+            startTimeoutRef.current = null;
+        }
+    };
+
     useEffect(() => {
         const token = localStorage.getItem("token");
 
@@ -153,11 +160,7 @@ export default function GamePage() {
         });
 
         socket.on("game_started", (data: GameState) => {
-            if (startTimeoutRef.current) {
-                clearTimeout(startTimeoutRef.current);
-                startTimeoutRef.current = null;
-            }
-
+            clearStartTimeout();
             setStartingGame(false);
             setGameState(data);
             setGamePhase("playing");
@@ -167,6 +170,7 @@ export default function GamePage() {
         });
 
         socket.on("next_question", (data: GameState) => {
+            clearStartTimeout();
             setStartingGame(false);
             setGameState(data);
             setSelectedAnswer(null);
@@ -197,11 +201,13 @@ export default function GamePage() {
         );
 
         socket.on("game_over", (data: GameState) => {
+            clearStartTimeout();
             setGameState(data);
             setGamePhase("results");
         });
 
         socket.on("error", (data: { message?: string } | string) => {
+            clearStartTimeout();
             setStartingGame(false);
             setError(
                 typeof data === "string"
@@ -211,6 +217,7 @@ export default function GamePage() {
         });
 
         socket.on("game_error", (data: { message?: string } | string) => {
+            clearStartTimeout();
             setStartingGame(false);
             setError(
                 typeof data === "string" ? data : data.message || "Game error",
@@ -218,17 +225,14 @@ export default function GamePage() {
         });
 
         socket.on("room_error", (data: { message?: string } | string) => {
+            clearStartTimeout();
             setError(
                 typeof data === "string" ? data : data.message || "Room error",
             );
         });
 
         return () => {
-            if (startTimeoutRef.current) {
-                clearTimeout(startTimeoutRef.current);
-                startTimeoutRef.current = null;
-            }
-
+            clearStartTimeout();
             socket.removeAllListeners();
             socket.disconnect();
             socketRef.current = null;
